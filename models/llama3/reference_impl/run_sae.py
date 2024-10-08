@@ -11,22 +11,22 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Running on device: {device}")
 
 # Load the tokenizer
-tokenizer = Tokenizer.get_instance() 
+tokenizer = Tokenizer.get_instance()
 
 # Initialize model arguments
 model_args = ModelArgs(
-    max_batch_size=2,          # You can adjust this based on your system's capacity
-    max_seq_len=2048,          # This is the maximum sequence length
-    dim=2048,                  # The hidden dimension of the model
-    n_layers=16,               # The number of transformer layers
-    n_heads=32,                # The number of attention heads per layer
-    vocab_size=128256,         # The vocabulary size as specified
-    ffn_dim_multiplier=1.5,    # Feedforward network multiplier
-    multiple_of=256,           # Used to ensure FFN hidden size is a multiple of this value
-    n_kv_heads=8,              # Number of key-value attention heads (this is smaller than n_heads)
-    norm_eps=1e-5,             # Epsilon value for normalization layers
-    rope_theta=500000.0,       # RoPE (Rotary Positional Embedding) scaling factor
-    use_scaled_rope=True       # Whether to use scaled RoPE embeddings
+    max_batch_size=5,
+    max_seq_len=2048,
+    dim=2048,
+    n_layers=16,
+    n_heads=32,
+    vocab_size=128256,
+    ffn_dim_multiplier=1.5,
+    multiple_of=256,
+    n_kv_heads=8,
+    norm_eps=1e-5,
+    rope_theta=500000.0,
+    use_scaled_rope=True
 )
 
 # Load the model
@@ -43,6 +43,9 @@ print("Model weights loaded successfully.")
 prompts = [
     "What is the capital of France?",
     "Explain quantum mechanics in simple terms.",
+    "Write a short story about a dragon.",
+    "What are the symptoms of diabetes?",
+    "Translate 'hello' to Arabic.",
 ]
 
 # Tokenize prompts
@@ -55,11 +58,8 @@ padded_prompts = [tokens + [0] * (max_len - len(tokens)) for tokens in tokenized
 input_ids = torch.tensor(padded_prompts).to(device)
 print(f"Padded input shape: {input_ids.shape}")
 
-
 # Dictionary to store activations
 activations_dict = {}
-
-# Run the model and collect activations
 with torch.no_grad():
     _ = model(
         tokens=input_ids,
@@ -68,29 +68,28 @@ with torch.no_grad():
         activations_dict=activations_dict,
         target_layer_ids=[10],  # Replace with the layer IDs you're interested in
     )
-
 for layer, activations in activations_dict.items():
     print(f"Collected activations from {layer}: Shape {activations.shape}")
 torch.save(activations_dict, 'activations_dict.pt')
 torch.save(tokenized_prompts, 'tokenized_prompts.pt')
 
 # Prepare activations tensor
-activations_tensor = torch.cat([activations_dict[key] for key in activations_dict], dim=0)
+activations_tensor = activations_dict['layer_10']
+print(f"Activations tensor shape: {activations_tensor.shape}")  # (batch_size, seq_len, dim)
 
-# Flatten activations if necessary
-activations_tensor = activations_tensor.view(-1, activations_tensor.shape[-1])
-print(f"Activations tensor shape after flattening: {activations_tensor.shape}")
+# Flatten activations for training
+activations_tensor_flat = activations_tensor.view(-1, activations_tensor.shape[-1])
+print(f"Activations tensor shape after flattening: {activations_tensor_flat.shape}")
 
-# Define the sparse autoencoder (from sparse_autoencoder.py)
-input_size = activations_tensor.shape[1]
+# Define the sparse autoencoder
+input_size = activations_tensor_flat.shape[1]
 hidden_size = 128  # Choose the size for the latent space
 autoencoder = SparseAutoencoder(input_size, hidden_size).to(device)
 print(f"Initialized Sparse Autoencoder with input size: {input_size}, hidden size: {hidden_size}")
 
 # Create dataset and dataloader
-dataset = TensorDataset(activations_tensor)
+dataset = TensorDataset(activations_tensor_flat)
 dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-
 
 # Loss function and optimizer
 criterion = nn.MSELoss()
@@ -118,9 +117,14 @@ for epoch in range(num_epochs):
 
     print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
 
-# After training, analyze the encoded features
-encoded_output_path = 'encoded_features.pt'  # Define the output file path
+# After training, obtain encoded features per prompt
+encoded_features_per_prompt = []
 
-# For example, save the encoded representations
-torch.save(encoded.cpu(), 'encoded_features.pt')
-print(f"Encoded features saved at: {encoded_output_path}")
+with torch.no_grad():
+    for i in range(activations_tensor.shape[0]):  # For each prompt
+        activations = activations_tensor[i].to(device)  # (seq_len, dim)
+        encoded = autoencoder.encoder(activations)      # (seq_len, hidden_size)
+        encoded_features_per_prompt.append(encoded.cpu())
+
+torch.save(encoded_features_per_prompt, 'encoded_features_per_prompt.pt')
+print("Encoded features per prompt saved.")
