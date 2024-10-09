@@ -54,9 +54,11 @@ for i, (prompt, tokens) in enumerate(zip(prompts, tokenized_prompts)):
     print(f"Prompt {i}: {prompt}")
     print(f"Tokenized Prompt {i}: {tokens}\n")
 max_len = max(len(tokens) for tokens in tokenized_prompts)
-padded_prompts = [tokens + [0] * (max_len - len(tokens)) for tokens in tokenized_prompts]
+pad_token_id = tokenizer.pad_id
+padded_prompts = [tokens + [pad_token_id] * (max_len - len(tokens)) for tokens in tokenized_prompts]
 input_ids = torch.tensor(padded_prompts).to(device)
 print(f"Padded input shape: {input_ids.shape}")
+print('Padded prompt tokens: ', padded_prompts)
 
 # Dictionary to store activations
 activations_dict = {}
@@ -71,7 +73,7 @@ with torch.no_grad():
 for layer, activations in activations_dict.items():
     print(f"Collected activations from {layer}: Shape {activations.shape}")
 torch.save(activations_dict, 'activations_dict.pt')
-torch.save(tokenized_prompts, 'tokenized_prompts.pt')
+torch.save(padded_prompts, 'tokenized_prompts.pt')
 
 # Prepare activations tensor
 activations_tensor = activations_dict['layer_10']
