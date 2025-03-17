@@ -18,10 +18,40 @@ import wandb
 import torch.nn.functional as F
 from models.llama3.reference_impl.run_sae import load_model_and_tokenizer, load_dataset_from_wikipedia, tokenize_data
 
+# def get_activations_and_tokens(model, tokenizer, tokenized_data, batch_size=5):
+#     # Collect activations
+#     all_activations = []
+#     all_tokens = []
+    
+#     for i in range(0, tokenized_data.shape[0], batch_size):
+#         batch_end = min(i + batch_size, tokenized_data.shape[0])
+#         batch = tokenized_data[i:batch_end]
+        
+#         activations_dict = {}
+#         def hook_fn(module, input, output):
+#             activations_dict['layer_10_w2'] = output.clone().detach()
+        
+#         layer_to_hook = model.layers[10].feed_forward.w2
+#         hook = layer_to_hook.register_forward_hook(hook_fn)
+        
+#         with torch.no_grad():
+#             _ = model(tokens=batch, start_pos=0)
+        
+#         hook.remove()
+        
+#         all_activations.append(activations_dict['layer_10_w2'])
+#         all_tokens.extend([tokenizer.decode([token.item()]) for token in batch.flatten()])
+
+#     activations = torch.cat(all_activations, dim=0)
+#     activations = activations.reshape(-1, activations.shape[-1])
+    
+#     return activations, all_tokens
+
 def get_activations_and_tokens(model, tokenizer, tokenized_data, batch_size=5):
-    # Collect activations
+    # Collect activations and preserve structure
     all_activations = []
-    all_tokens = []
+    all_token_texts = []
+    batch_mapping = []  # To map flattened indices back to (batch_idx, pos_idx)
     
     for i in range(0, tokenized_data.shape[0], batch_size):
         batch_end = min(i + batch_size, tokenized_data.shape[0])
@@ -39,13 +69,35 @@ def get_activations_and_tokens(model, tokenizer, tokenized_data, batch_size=5):
         
         hook.remove()
         
+        # Store activations
         all_activations.append(activations_dict['layer_10_w2'])
-        all_tokens.extend([tokenizer.decode([token.item()]) for token in batch.flatten()])
-
-    activations = torch.cat(all_activations, dim=0)
-    activations = activations.reshape(-1, activations.shape[-1])
+        
+        # Store token texts but preserve batch structure
+        batch_tokens = []
+        for seq_idx in range(batch.shape[0]):
+            seq_tokens = [tokenizer.decode([token.item()]) for token in batch[seq_idx]]
+            batch_tokens.append(seq_tokens)
+        all_token_texts.append(batch_tokens)
+        
+        # Create mapping to reconstruct batch/sequence position
+        for batch_idx in range(batch.shape[0]):
+            for pos_idx in range(batch.shape[1]):
+                flat_idx = len(batch_mapping)
+                batch_mapping.append((i + batch_idx, pos_idx))
     
-    return activations, all_tokens
+    # Stack activations but preserve structure
+    activations = torch.cat(all_activations, dim=0)
+    
+    # Flatten activations for autoencoder
+    flat_activations = activations.reshape(-1, activations.shape[-1])
+    
+    # Flatten token texts for simple lookup
+    flat_tokens = []
+    for batch in all_token_texts:
+        for seq in batch:
+            flat_tokens.extend(seq)
+    
+    return flat_activations, flat_tokens, tokenized_data, batch_mapping
 
 def calculate_loss_ratio(model, tokenized_data, autoencoder, device, batch_size=5):
     """
@@ -280,8 +332,35 @@ def plot_activation_frequencies_comparison(transformer_activations, autoencoder,
 
     return transformer_frequencies, autoencoder_frequencies
 
-def analyze_feature_activations(autoencoder, activations, tokens, top_k=8):
-    """Analyze which tokens cause each feature to activate most strongly."""
+# def analyze_feature_activations(autoencoder, activations, tokens, top_k=8):
+#     """Analyze which tokens cause each feature to activate most strongly."""
+#     with torch.no_grad():
+#         # Get feature activations
+#         _, feature_activations = autoencoder(activations)
+#         feature_activations = feature_activations.cpu().numpy()
+        
+#     num_features = feature_activations.shape[1]
+#     feature_analysis = []
+    
+#     for feature_idx in range(num_features):
+#         # Get activations for this feature
+#         feature_values = feature_activations[:, feature_idx]
+        
+#         # Get top k activating tokens
+#         top_indices = np.argsort(feature_values)[-top_k:][::-1]
+#         top_tokens = [tokens[idx] for idx in top_indices]
+#         top_activations = [feature_values[idx] for idx in top_indices]
+        
+#         feature_analysis.append({
+#             'feature_id': feature_idx,
+#             'top_tokens': top_tokens,
+#             'top_activations': top_activations
+#         })
+    
+#     return feature_analysis
+
+def analyze_feature_activations(autoencoder, activations, tokens, tokenized_data, batch_mapping, top_k=8, context_window=5):
+    """Analyze which tokens cause each feature to activate most strongly, with context."""
     with torch.no_grad():
         # Get feature activations
         _, feature_activations = autoencoder(activations)
@@ -290,31 +369,113 @@ def analyze_feature_activations(autoencoder, activations, tokens, top_k=8):
     num_features = feature_activations.shape[1]
     feature_analysis = []
     
+    # Create tokenizer for context extraction (adjust this based on your tokenizer)
+    def get_context(batch_idx, pos_idx, window=context_window):
+        # Get the sequence from tokenized_data
+        sequence = tokenized_data[batch_idx].cpu().tolist()
+        
+        # Extract context
+        start_idx = max(0, pos_idx - window)
+        end_idx = min(len(sequence), pos_idx + window + 1)
+        context_ids = sequence[start_idx:end_idx]
+        
+        # Convert to tokens
+        context_tokens = [tokenizer.decode([token_id]) if isinstance(token_id, (int, float)) else "<unknown>" 
+                 for token_id in context_ids]
+        target_pos = pos_idx - start_idx
+        
+        return {
+            'context_tokens': context_tokens,
+            'target_position': target_pos
+        }
+    
     for feature_idx in range(num_features):
         # Get activations for this feature
         feature_values = feature_activations[:, feature_idx]
         
-        # Get top k activating tokens
+        # Get top k activating positions
         top_indices = np.argsort(feature_values)[-top_k:][::-1]
-        top_tokens = [tokens[idx] for idx in top_indices]
-        top_activations = [feature_values[idx] for idx in top_indices]
+        
+        top_tokens = []
+        top_contexts = []
+        top_positions = []
+        top_activations = []
+        
+        for idx in top_indices:
+            # Get the batch and position from mapping
+            if idx < len(batch_mapping):
+                batch_idx, pos_idx = batch_mapping[idx]
+                
+                # Get token
+                if idx < len(tokens):
+                    token = tokens[idx]
+                else:
+                    token = "<unknown>"
+                
+                # Get context
+                context = get_context(batch_idx, pos_idx, context_window)
+                
+                top_tokens.append(token)
+                top_contexts.append(context)
+                top_positions.append((batch_idx, pos_idx))
+                top_activations.append(feature_values[idx])
         
         feature_analysis.append({
             'feature_id': feature_idx,
             'top_tokens': top_tokens,
+            'top_contexts': top_contexts,
+            'top_positions': top_positions,
             'top_activations': top_activations
         })
     
     return feature_analysis
 
+# def create_feature_activation_table(feature_analysis, output_file='feature_analysis.csv'):
+#     """Create and save a table of feature activations."""
+#     rows = []
+#     for feature in feature_analysis:
+#         for token, activation in zip(feature['top_tokens'], feature['top_activations']):
+#             rows.append({
+#                 'Feature ID': feature['feature_id'],
+#                 'Token': token,
+#                 'Activation': activation
+#             })
+    
+#     df = pd.DataFrame(rows)
+#     df.to_csv(output_file, index=False)
+#     return df
+
 def create_feature_activation_table(feature_analysis, output_file='feature_analysis.csv'):
-    """Create and save a table of feature activations."""
+    """Create and save a table of feature activations with context."""
     rows = []
     for feature in feature_analysis:
-        for token, activation in zip(feature['top_tokens'], feature['top_activations']):
+        for i in range(len(feature['top_tokens'])):
+            token = feature['top_tokens'][i]
+            activation = feature['top_activations'][i]
+            context = feature['top_contexts'][i]
+            position = feature['top_positions'][i]
+            
+            # Format the context as a string, highlighting the target token
+            context_str = ""
+            if context:
+                context_tokens = context['context_tokens']
+                target_pos = context['target_position']
+                
+                formatted_context = []
+                for j, ctx_token in enumerate(context_tokens):
+                    if j == target_pos:
+                        formatted_context.append(f"[{ctx_token}]")  # Highlight the target token
+                    else:
+                        formatted_context.append(ctx_token)
+                
+                context_str = " ".join(formatted_context)
+            
             rows.append({
                 'Feature ID': feature['feature_id'],
                 'Token': token,
+                'Context': context_str,
+                'Batch_Idx': position[0],
+                'Position_Idx': position[1],
                 'Activation': activation
             })
     
@@ -334,9 +495,12 @@ if __name__ == '__main__':
     data = load_dataset_from_wikipedia()
     tokenized_data = tokenize_data(data, tokenizer, device)
 
-    activations, tokens = get_activations_and_tokens(model, tokenizer, tokenized_data)
-    print(f"Collected activations shape: {activations.shape}")
+    # activations, tokens = get_activations_and_tokens(model, tokenizer, tokenized_data)
     
+    # Get activations and preserving structure
+    activations, tokens, tokenized_data, batch_mapping = get_activations_and_tokens(model, tokenizer, tokenized_data)
+    print(f"Collected activations shape: {activations.shape}")
+
     # Load trained autoencoder
     input_size = activations.shape[1]
     hidden_size = 4096
@@ -354,9 +518,20 @@ if __name__ == '__main__':
     # # Plot activation frequencies comparison
     # transformer_frequencies, autoencoder_frequencies = plot_activation_frequencies_comparison(activations_tensor_flat, autoencoder, device)
 
-    # Analyze features
-    feature_analysis = analyze_feature_activations(autoencoder, activations, tokens)
-    print("Analyzed feature activations")
+    # # Analyze features
+    # feature_analysis = analyze_feature_activations(autoencoder, activations, tokens)
+    # print("Analyzed feature activations")
+
+    # Analyze feature activations with context
+    feature_analysis = analyze_feature_activations(
+        autoencoder, 
+        activations, 
+        tokens, 
+        tokenized_data, 
+        batch_mapping,
+        top_k=8, 
+        context_window=5
+    )
     
     # Create and save analysis table
     df = create_feature_activation_table(feature_analysis)
